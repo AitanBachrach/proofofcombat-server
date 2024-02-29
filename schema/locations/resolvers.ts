@@ -21,23 +21,56 @@ import {
   PlayerLocationUpgradeDescription,
   PlayerLocationBuildingDescription,
   SettlementManager,
+  MilitaryUnitInput,
 } from "types/graphql";
 import type { BaseContext } from "schema/context";
 
+import { ResourceDataEntry } from "../../db/models/player-location";
 import { LocationData, MapNames } from "../../constants";
 import { specialLocations, distance2d } from "../../helpers";
 import { Pathfinder } from "../../pathfinding";
 import { hasQuestItem, checkCapital } from "../quests/helpers";
 import { countEnchantments } from "../items/helpers";
+import { checkTeleport } from "../quests/staff-of-teleportation";
 
 import { getShopData, executeNpcTrade } from "./npc-shops";
-import { CampUpgrades } from "./camp-upgrades";
+import {
+  CampUpgrades,
+  SettlementUpgrades,
+  getUpgradesForLocation,
+} from "./camp-upgrades";
 import {
   payForBuilding,
-  canAffordBuilding,
+  shouldSeeBuilding,
   Buildings,
   validBuildingLocationType,
+  DescribedBuildings,
 } from "./settlement-buildings";
+
+export const attackingIsDisabled = true;
+
+const combatStats = {
+  enlisted: {
+    health: 2,
+    damage: 1,
+  },
+  soldier: {
+    health: 8,
+    damage: 4,
+  },
+  veteran: {
+    health: 32,
+    damage: 16,
+  },
+  ghost: {
+    health: 256,
+    damage: 64,
+  },
+  fortifications: {
+    health: 150,
+    damage: 6,
+  },
+};
 
 function isCloseToSpecialLocation(location: Location): boolean {
   return !!LocationData[location.map as MapNames].specialLocations.find(
@@ -94,6 +127,7 @@ function createSettlementManager(
     range: context.db.playerLocation.range(capital),
     availableUpgrades: [],
     availableBuildings: [],
+    adjacentTiles: [],
   };
 }
 
@@ -126,31 +160,10 @@ const resolvers: Resolvers = {
         return [];
       }
 
-      const upgradeList: PlayerLocationUpgradeDescription[] = [];
+      const upgradeList: PlayerLocationUpgradeDescription[] =
+        getUpgradesForLocation(playerLocation);
 
-      upgradeList.push(...Object.values(CampUpgrades));
-
-      return upgradeList
-        .filter((upgrade) => {
-          if (playerLocation.upgrades.indexOf(upgrade.type) > -1) {
-            return false;
-          }
-          if (
-            !upgrade.cost.reduce((canAfford, cost) => {
-              const resource = playerLocation.resources.find(
-                (res) => res.name === cost.name,
-              );
-              if (!resource) {
-                return canAfford;
-              }
-              return canAfford && cost.value <= (resource.maximum ?? 0);
-            }, true)
-          ) {
-            return false;
-          }
-          return true;
-        })
-        .slice(0, 3);
+      return upgradeList.slice(0, 4);
     },
     async docks(
       parent,
@@ -253,6 +266,824 @@ const resolvers: Resolvers = {
     },
   },
   Mutation: {
+    async moveTroups(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+
+      const hero = await context.db.hero.get(context.auth.id);
+      const home = await context.db.playerLocation.getHome(hero.id);
+      if (!home) {
+        throw new UserInputError("You don't have a working capital");
+      }
+
+      const unitTypes: (keyof MilitaryUnitInput)[] = [
+        "enlisted",
+        "soldier",
+        "veteran",
+        "ghost",
+      ];
+
+      const targetPlayerLocation = await context.db.playerLocation.get(
+        context.db.playerLocation.locationId(args.target),
+      );
+
+      let resourceData = await Promise.all(
+        unitTypes.map(async (resourceType) => {
+          const resources = await context.db.playerLocation.getResourceData(
+            home,
+            resourceType,
+          );
+
+          const total = resources.reduce((memo, val) => {
+            return memo + (val.resource?.value ?? 0);
+          }, 0);
+
+          const maximum = context.db.playerLocation.resourceStorage(
+            targetPlayerLocation,
+            resourceType,
+          );
+
+          const locationResource = targetPlayerLocation.resources.find(
+            (r) => r.name === resourceType,
+          );
+
+          if (!locationResource) {
+            throw new UserInputError(
+              `Target location does not have storage for ${resourceType}`,
+            );
+          }
+
+          return {
+            resources,
+            total,
+            maximum,
+            name: resourceType,
+            locationResource,
+          };
+        }),
+      );
+
+      await Promise.all(
+        unitTypes.map(async (unitName) => {
+          if (!(unitName in args.units)) {
+            throw new UserInputError(`Invalid input for value ${unitName}`);
+          }
+          const value = args.units[unitName];
+          if (
+            value === undefined ||
+            value === null ||
+            isNaN(value) ||
+            !isFinite(value) ||
+            value < 0
+          ) {
+            throw new UserInputError(`Invalid input for value ${unitName}`);
+          }
+          const data = resourceData.find((r) => r.name === unitName);
+          if (!data) {
+            throw new UserInputError(
+              `Failed to find any ${unitName} in your empire`,
+            );
+          }
+          if (data.total < value) {
+            throw new UserInputError(
+              `You do not have that many ${unitName} to move`,
+            );
+          }
+          if (value + data.locationResource.value > data.maximum) {
+            throw new UserInputError(
+              `There is not enough storage for that many ${unitName} in the target location`,
+            );
+          }
+        }),
+      );
+
+      await Promise.all(
+        unitTypes.map(async (unitName) => {
+          const amount = args.units[unitName] as number;
+          const result = await context.db.playerLocation.spendResources(
+            home,
+            unitName,
+            amount,
+          );
+
+          if (!result) {
+            throw new Error(`Failed to spend resournce ${unitName}`);
+          }
+          const data = resourceData.find((r) => r.name === unitName);
+          if (!data) {
+            throw new UserInputError(
+              `Failed to find any ${unitName} in your empire`,
+            );
+          }
+          data.locationResource.value = data.locationResource.value + amount;
+        }),
+      );
+
+      await context.db.playerLocation.put(targetPlayerLocation);
+
+      return { location: targetPlayerLocation };
+    },
+    async attackLocation(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+
+      if (attackingIsDisabled) {
+        throw new UserInputError("Attacking is currently disabled.");
+      }
+
+      const builtInFortifications = 1000;
+      const targetLocation = args.target;
+
+      const targetPlayerLocation = await context.db.playerLocation.get(
+        context.db.playerLocation.locationId(targetLocation),
+      );
+
+      if (
+        !targetPlayerLocation ||
+        targetPlayerLocation.owner === context.auth.id
+      ) {
+        throw new UserInputError("Invalid attack target");
+      }
+
+      const targetHome = await context.db.playerLocation.getHome(
+        targetPlayerLocation.owner,
+      );
+      // ugh typescript lol
+      const rawHome = await context.db.playerLocation.getHome(context.auth.id);
+      if (!rawHome) {
+        throw new UserInputError("You don't have a working capital");
+      }
+      const home: PlayerLocation = rawHome;
+
+      const unitTypes: (keyof MilitaryUnitInput)[] = [
+        "enlisted",
+        "soldier",
+        "veteran",
+        "ghost",
+      ];
+
+      const targetResources: {
+        [x in keyof MilitaryUnitInput | "fortifications"]?: {
+          resource: ResourceDataEntry[];
+          total: number;
+        };
+      } = {};
+
+      if (targetHome) {
+        const targetResource = (
+          await context.db.playerLocation.getResourceData(
+            targetHome,
+            "fortifications",
+          )
+        ).filter((entry) => {
+          return (
+            Math.abs(entry.location.location.x - targetLocation.x) +
+              Math.abs(entry.location.location.y - targetLocation.y) <
+            3
+          );
+        });
+        const total = targetResource.reduce((memo, val) => {
+          return memo + val.resource.value;
+        }, targetResource.length * builtInFortifications);
+        targetResources.fortifications = { resource: targetResource, total };
+      } else {
+        const fortificationsResource = targetPlayerLocation.resources.find(
+          (res) => res.name === "fortifications",
+        );
+        if (fortificationsResource) {
+          targetResources.fortifications = {
+            resource: [
+              {
+                resource: fortificationsResource,
+                location: targetPlayerLocation,
+              },
+            ],
+            total: fortificationsResource.value + builtInFortifications,
+          };
+        }
+      }
+
+      await Promise.all(
+        unitTypes.map(
+          async (unitType: keyof MilitaryUnitInput, unitRank: number) => {
+            const resources = await context.db.playerLocation.getResourceData(
+              home,
+              unitType,
+            );
+
+            if (targetHome) {
+              const targetResource = (
+                await context.db.playerLocation.getResourceData(
+                  targetHome,
+                  unitType,
+                )
+              ).filter((entry) => {
+                return (
+                  Math.abs(entry.location.location.x - targetLocation.x) +
+                    Math.abs(entry.location.location.y - targetLocation.y) <
+                  3
+                );
+              });
+              const total = targetResource.reduce((memo, val) => {
+                return memo + val.resource.value;
+              }, 0);
+              targetResources[unitType] = { resource: targetResource, total };
+            } else {
+              const unitTypeResource = targetPlayerLocation.resources.find(
+                (res) => res.name === unitType,
+              );
+              if (unitTypeResource) {
+                targetResources[unitType] = {
+                  resource: [
+                    {
+                      resource: unitTypeResource,
+                      location: targetPlayerLocation,
+                    },
+                  ],
+                  total: unitTypeResource.value,
+                };
+              }
+            }
+
+            const total = resources.reduce(
+              (memo, val) => memo + (val.resource?.value ?? 0),
+              0,
+            );
+
+            const inputValue = args.units[unitType];
+
+            if (
+              inputValue == null ||
+              inputValue > total ||
+              isNaN(inputValue) ||
+              !isFinite(inputValue)
+            ) {
+              throw new UserInputError(
+                `Invalid number of ${unitType} specified`,
+              );
+            }
+          },
+        ),
+      );
+
+      const attackerAttributes = {
+        enlisted: {
+          health: (args.units.enlisted ?? 0) * combatStats.enlisted.health,
+          damage: (args.units.enlisted ?? 0) * combatStats.enlisted.damage,
+          count: args.units.enlisted ?? 0,
+        },
+        soldier: {
+          health: (args.units.soldier ?? 0) * combatStats.soldier.health,
+          damage: (args.units.soldier ?? 0) * combatStats.soldier.damage,
+          count: args.units.soldier ?? 0,
+        },
+        veteran: {
+          health: (args.units.veteran ?? 0) * combatStats.veteran.health,
+          damage: (args.units.veteran ?? 0) * combatStats.veteran.damage,
+          count: args.units.veteran ?? 0,
+        },
+        ghost: {
+          health: (args.units.ghost ?? 0) * combatStats.ghost.health,
+          damage: (args.units.ghost ?? 0) * combatStats.ghost.damage,
+          count: args.units.ghost ?? 0,
+        },
+      };
+      const defenderAttributes = {
+        enlisted: {
+          health:
+            (targetResources.enlisted?.total ?? 0) *
+            combatStats.enlisted.health,
+          damage:
+            (targetResources.enlisted?.total ?? 0) *
+            combatStats.enlisted.damage,
+          count: targetResources.enlisted?.total ?? 0,
+        },
+        soldier: {
+          health:
+            (targetResources.soldier?.total ?? 0) * combatStats.soldier.health,
+          damage:
+            (targetResources.soldier?.total ?? 0) * combatStats.soldier.damage,
+          count: targetResources.soldier?.total ?? 0,
+        },
+        veteran: {
+          health:
+            (targetResources.veteran?.total ?? 0) * combatStats.veteran.health,
+          damage:
+            (targetResources.veteran?.total ?? 0) * combatStats.veteran.damage,
+          count: targetResources.veteran?.total ?? 0,
+        },
+        ghost: {
+          health:
+            (targetResources.ghost?.total ?? 0) * combatStats.ghost.health,
+          damage:
+            (targetResources.ghost?.total ?? 0) * combatStats.ghost.damage,
+          count: targetResources.ghost?.total ?? 0,
+        },
+        fortifications: {
+          health:
+            (targetResources.fortifications?.total ?? 0) *
+            combatStats.fortifications.health,
+          damage:
+            (targetResources.fortifications?.total ?? 0) *
+            combatStats.fortifications.damage,
+          count: targetResources.fortifications?.total ?? 0,
+        },
+      };
+
+      const totalAttackerDamage =
+        attackerAttributes.enlisted.damage +
+        attackerAttributes.soldier.damage +
+        attackerAttributes.veteran.damage +
+        attackerAttributes.ghost.damage;
+      const totalDefenderDamage =
+        defenderAttributes.enlisted.damage +
+        defenderAttributes.soldier.damage +
+        defenderAttributes.veteran.damage +
+        defenderAttributes.fortifications.damage +
+        defenderAttributes.ghost.damage +
+        context.db.playerLocation.defensiveDamage(targetPlayerLocation.type);
+
+      const totalAttackerHealth =
+        attackerAttributes.enlisted.health +
+        attackerAttributes.soldier.health +
+        attackerAttributes.veteran.health +
+        attackerAttributes.ghost.health;
+      const totalDefenderHealth =
+        1.5 *
+        (defenderAttributes.enlisted.health +
+          defenderAttributes.soldier.health +
+          defenderAttributes.veteran.health +
+          defenderAttributes.fortifications.health +
+          defenderAttributes.ghost.health);
+
+      const totalRemainingDefenderHealth = Math.max(
+        0,
+        totalDefenderHealth - totalAttackerDamage,
+      );
+      const percentRemainingDefenderHealth =
+        totalRemainingDefenderHealth / totalDefenderHealth;
+
+      const totalRemainingAttackerHealth = Math.max(
+        0,
+        totalAttackerHealth - totalDefenderDamage,
+      );
+      const percentRemainingAttackerHealth =
+        totalRemainingAttackerHealth / totalAttackerHealth;
+
+      function applyDamage(unitCount: number, percent: number): number {
+        const rawRemaining = unitCount * (1 - percent);
+        const result = Math.ceil(rawRemaining);
+        return result - (result - rawRemaining > Math.random() ? 1 : 0);
+      }
+
+      const defenderCasualties = {
+        enlisted: applyDamage(
+          defenderAttributes.enlisted.count,
+          percentRemainingDefenderHealth * 0.9 + 0.1,
+        ),
+        soldier: applyDamage(
+          defenderAttributes.soldier.count,
+          percentRemainingDefenderHealth * 0.9 + 0.1,
+        ),
+        veteran: applyDamage(
+          defenderAttributes.veteran.count,
+          percentRemainingDefenderHealth * 0.9 + 0.1,
+        ),
+        ghost: applyDamage(
+          defenderAttributes.ghost.count,
+          percentRemainingDefenderHealth * 0.9 + 0.1,
+        ),
+        fortifications: Math.round(
+          0.2 *
+            applyDamage(
+              defenderAttributes.fortifications.count -
+                (targetResources.fortifications?.resource.length ?? 0) *
+                  builtInFortifications,
+              percentRemainingDefenderHealth,
+            ) +
+            0.8 *
+              Math.max(
+                0,
+                applyDamage(
+                  defenderAttributes.fortifications.count,
+                  percentRemainingDefenderHealth,
+                ) -
+                  (targetResources.fortifications?.resource.length ?? 0) *
+                    builtInFortifications,
+              ),
+        ),
+      };
+
+      const attackerCasualties = {
+        enlisted: applyDamage(
+          attackerAttributes.enlisted.count,
+          percentRemainingAttackerHealth,
+        ),
+        soldier: applyDamage(
+          attackerAttributes.soldier.count,
+          percentRemainingAttackerHealth,
+        ),
+        veteran: applyDamage(
+          attackerAttributes.veteran.count,
+          percentRemainingAttackerHealth,
+        ),
+        ghost: applyDamage(
+          attackerAttributes.ghost.count,
+          percentRemainingAttackerHealth,
+        ),
+      };
+
+      console.log(attackerAttributes, args.units);
+      console.log("vs");
+      console.log(defenderAttributes, targetResources);
+
+      console.log(
+        "casualties",
+        percentRemainingDefenderHealth,
+        defenderAttributes.fortifications.count,
+        applyDamage(
+          defenderAttributes.fortifications.count,
+          percentRemainingDefenderHealth,
+        ),
+      );
+
+      console.log(defenderCasualties);
+      console.log(attackerCasualties);
+
+      if (targetResources.enlisted && defenderCasualties.enlisted > 0) {
+        await context.db.playerLocation.spendResourcesFromData(
+          targetResources.enlisted?.resource ?? [],
+          defenderCasualties.enlisted,
+        );
+      }
+      if (targetResources.soldier && defenderCasualties.soldier > 0) {
+        await context.db.playerLocation.spendResourcesFromData(
+          targetResources.soldier?.resource ?? [],
+          defenderCasualties.soldier,
+        );
+      }
+      if (targetResources.veteran && defenderCasualties.veteran > 0) {
+        await context.db.playerLocation.spendResourcesFromData(
+          targetResources.veteran?.resource ?? [],
+          defenderCasualties.veteran,
+        );
+      }
+      if (targetResources.ghost && defenderCasualties.ghost > 0) {
+        await context.db.playerLocation.spendResourcesFromData(
+          targetResources.ghost?.resource ?? [],
+          defenderCasualties.ghost,
+        );
+      }
+      if (
+        targetResources.fortifications &&
+        defenderCasualties.fortifications > 0
+      ) {
+        await context.db.playerLocation.spendResourcesFromData(
+          targetResources.fortifications?.resource ?? [],
+          defenderCasualties.fortifications,
+        );
+      }
+      if (attackerCasualties.enlisted > 0) {
+        await context.db.playerLocation.spendResources(
+          home,
+          "enlisted",
+          attackerCasualties.enlisted,
+        );
+      }
+      if (attackerCasualties.soldier > 0) {
+        await context.db.playerLocation.spendResources(
+          home,
+          "soldier",
+          attackerCasualties.soldier,
+        );
+      }
+      if (attackerCasualties.veteran > 0) {
+        await context.db.playerLocation.spendResources(
+          home,
+          "veteran",
+          attackerCasualties.veteran,
+        );
+      }
+      if (attackerCasualties.ghost > 0) {
+        await context.db.playerLocation.spendResources(
+          home,
+          "ghost",
+          attackerCasualties.ghost,
+        );
+      }
+
+      // buildings take 1/10th damage
+      let overDamage = Math.round(
+        (totalAttackerDamage - totalDefenderHealth) / 10,
+      );
+      let didDestroy = false;
+      let didDealDamage = false;
+      // deal wit over-damage
+      if (overDamage > 0) {
+        const garrisonHealth = targetResources.fortifications
+          ? (targetResources.fortifications?.resource ?? []).reduce(
+              (memo, val) => memo + (val.location.health - 1),
+              0,
+            )
+          : 0;
+
+        console.log(
+          { overDamage, garrisonHealth },
+          targetResources.fortifications,
+          targetPlayerLocation.health,
+        );
+
+        if (garrisonHealth > 0 && targetResources.fortifications) {
+          const damage =
+            overDamage > garrisonHealth ? garrisonHealth : overDamage;
+          const garrisonCount = targetResources.fortifications.resource.length;
+          console.log("Dealing", damage, "to", garrisonCount, "garrisons");
+          await Promise.all(
+            targetResources.fortifications.resource.map(async (entry) => {
+              const localDamage = Math.min(
+                entry.location.health - 1,
+                Math.floor(damage * (entry.location.health / garrisonHealth)),
+              );
+              console.log(
+                "Dealing",
+                localDamage,
+                "to garrison with",
+                entry.location.health,
+              );
+              entry.location.health -= localDamage;
+              overDamage -= localDamage;
+              await context.db.playerLocation.put(entry.location);
+            }),
+          );
+        }
+
+        if (overDamage > 0) {
+          console.log("After garrisons we still have", overDamage);
+          if (overDamage >= targetPlayerLocation.health) {
+            // kill!.... later
+
+            targetPlayerLocation.health = targetPlayerLocation.maxHealth * 0.1;
+            targetPlayerLocation.owner = context.auth.id;
+            didDestroy = true;
+            didDealDamage = true;
+          } else {
+            targetPlayerLocation.health -= overDamage;
+            await context.db.playerLocation.put(targetPlayerLocation);
+            didDealDamage = true;
+          }
+        }
+        // overDamage;
+      }
+
+      return { target: targetPlayerLocation };
+    },
+    async recruit(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+
+      const hero = await context.db.hero.get(context.auth.id);
+      const targetLocation = args.location;
+      const playerLocation = await context.db.playerLocation.get(
+        context.db.playerLocation.locationId(targetLocation),
+      );
+
+      if (playerLocation.owner !== context.auth.id) {
+        throw new ForbiddenError(
+          "You must own this location to recruit troops there",
+        );
+      }
+      if (playerLocation.type !== PlayerLocationType.Barracks) {
+        throw new UserInputError("You may only recruit troops at a barracks");
+      }
+      if (args.amount <= 0) {
+        throw new UserInputError("You must recruit at least 1 troop");
+      }
+
+      const enlistedResource = playerLocation.resources.find(
+        (res) => res.name === "enlisted",
+      );
+
+      if (!enlistedResource) {
+        throw new Error("Could not find enlisted troop resource");
+      }
+
+      const cost = 1000000 * args.amount;
+      const home = await context.db.playerLocation.getHome(hero.id);
+      if (!home) {
+        throw new UserInputError("You don't have a working capital");
+      }
+      if (cost > hero.gold) {
+        const result = await context.db.playerLocation.spendResources(
+          home,
+          "bonds",
+          Math.ceil(cost / 1000000),
+        );
+
+        if (!result) {
+          throw new UserInputError("You cannot afford that many troops");
+        }
+      } else {
+        hero.gold -= cost;
+      }
+
+      enlistedResource.value += args.amount;
+
+      await context.db.playerLocation.put(playerLocation);
+      await context.db.hero.put(hero);
+
+      return { location: playerLocation };
+    },
+    async craftHoneyEssences(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+
+      const hero = await context.db.hero.get(context.auth.id);
+      const targetLocation = args.location;
+      const playerLocation = await context.db.playerLocation.get(
+        context.db.playerLocation.locationId(targetLocation),
+      );
+
+      if (playerLocation.owner !== context.auth.id) {
+        throw new ForbiddenError("You must own this location to craft there");
+      }
+      if (playerLocation.type !== PlayerLocationType.Apiary) {
+        throw new UserInputError(
+          "You may only craft honey essences in an apiary",
+        );
+      }
+      if (args.amount <= 0) {
+        throw new UserInputError("You must craft at least 1 essence");
+      }
+
+      const cost = 1000000 * args.amount;
+      const honeyResource = playerLocation.resources.find(
+        (res) => res.name === "honey",
+      );
+
+      if (!honeyResource) {
+        throw new Error("Could not find enlisted troop resource");
+      }
+      const honeyCost = 10 * args.amount;
+      if (honeyResource.value < honeyCost) {
+        throw new UserInputError("You cannot afford that many essences");
+      }
+
+      if (cost > hero.gold) {
+        const home = await context.db.playerLocation.getHome(hero.id);
+        if (!home) {
+          throw new UserInputError("You don't have a working capital");
+        }
+        const result = await context.db.playerLocation.spendResources(
+          home,
+          "bonds",
+          Math.ceil(cost / 1000000),
+        );
+
+        if (!result) {
+          throw new UserInputError("You cannot afford that many essences");
+        }
+      } else {
+        hero.gold -= cost;
+      }
+
+      honeyResource.value -= args.amount;
+
+      await context.db.playerLocation.put(playerLocation);
+      await context.db.hero.put(hero);
+
+      return { location: playerLocation };
+    },
+    async buildFortifications(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+
+      const hero = await context.db.hero.get(context.auth.id);
+      const targetLocation = args.location;
+      const playerLocation = await context.db.playerLocation.get(
+        context.db.playerLocation.locationId(targetLocation),
+      );
+
+      if (playerLocation.owner !== context.auth.id) {
+        throw new ForbiddenError(
+          "You must own this location to build fortifications there",
+        );
+      }
+      if (playerLocation.type !== PlayerLocationType.Garrison) {
+        throw new UserInputError(
+          "You may only build fortifications at a garrison",
+        );
+      }
+
+      const fortificationsResource = playerLocation.resources.find(
+        (res) => res.name === "fortifications",
+      );
+      if (!fortificationsResource) {
+        throw new Error("Could not find fortifications resource");
+      }
+
+      if (args.amount <= 0) {
+        throw new UserInputError("You must build at least 1 fortification");
+      }
+
+      const cost = 1000000 * args.amount;
+
+      if (cost > hero.gold) {
+        const home = await context.db.playerLocation.getHome(hero.id);
+        if (!home) {
+          throw new UserInputError("You don't have a working capital");
+        }
+
+        const result = await context.db.playerLocation.spendResources(
+          home,
+          "bonds",
+          Math.ceil(cost / 1000000),
+        );
+
+        if (!result) {
+          throw new UserInputError(
+            "You cannot afford that many fortifications",
+          );
+        }
+      } else {
+        hero.gold -= cost;
+      }
+
+      fortificationsResource.value += args.amount;
+
+      await context.db.playerLocation.put(playerLocation);
+      await context.db.hero.put(hero);
+
+      return { location: playerLocation };
+    },
+    async purchaseBonds(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+
+      const hero = await context.db.hero.get(context.auth.id);
+      const targetLocation = args.location;
+      const playerLocation = await context.db.playerLocation.get(
+        context.db.playerLocation.locationId(targetLocation),
+      );
+
+      if (playerLocation.owner !== context.auth.id) {
+        throw new ForbiddenError(
+          "You must own this location to purchase bonds there",
+        );
+      }
+      if (playerLocation.type !== PlayerLocationType.Treasury) {
+        throw new UserInputError("You may only purchase bonds at a treasury");
+      }
+
+      const bondsResource = playerLocation.resources.find(
+        (res) => res.name === "bonds",
+      );
+      if (!bondsResource) {
+        throw new Error("Could not find bonds resource");
+      }
+
+      if (args.amount <= 0) {
+        const amount = 0 - args.amount;
+        if (amount > bondsResource.value) {
+          throw new UserInputError("You do not have that many bonds");
+        }
+
+        const cost = 1000000 * amount;
+        hero.gold += cost;
+        bondsResource.value -= amount;
+      } else {
+        const cost = 1000000 * args.amount;
+
+        if (cost > hero.gold) {
+          const home = await context.db.playerLocation.getHome(hero.id);
+          if (!home) {
+            throw new UserInputError("You don't have a working capital");
+          }
+          const result = await context.db.playerLocation.spendResources(
+            home,
+            "bonds",
+            Math.ceil(args.amount),
+          );
+
+          if (!result) {
+            throw new UserInputError("You cannot afford that many bonds");
+          }
+        } else {
+          hero.gold -= cost;
+        }
+        bondsResource.value += args.amount;
+      }
+      await context.db.playerLocation.put(playerLocation);
+      await context.db.hero.put(hero);
+
+      return { location: playerLocation };
+    },
+
     async destroyBuilding(parent, args, context) {
       if (!context?.auth?.id) {
         throw new ForbiddenError("Missing auth");
@@ -357,16 +1188,18 @@ const resolvers: Resolvers = {
         );
       }
 
-      const newLocation = await context.db.playerLocation.put({
-        id: context.db.playerLocation.locationId(targetLocation),
-        type: buildingType,
-        availableUpgrades: [],
-        connections: [],
-        location: targetLocation,
-        owner: context.auth.id,
-        resources: [],
-        upgrades: [],
-      });
+      const newLocation = await context.db.playerLocation.put(
+        context.db.playerLocation.upgrade({
+          id: context.db.playerLocation.locationId(targetLocation),
+          type: buildingType,
+          availableUpgrades: [],
+          connections: [],
+          location: targetLocation,
+          owner: context.auth.id,
+          resources: [],
+          upgrades: [],
+        }),
+      );
 
       capital.connections.push(newLocation);
       if (
@@ -400,11 +1233,13 @@ const resolvers: Resolvers = {
       if (camp.upgrades.find((entry) => entry === args.upgrade)) {
         throw new UserInputError("You already own that upgrade!");
       }
-      const upgrade = CampUpgrades[args.upgrade];
+      const isSettlement = args.upgrade === PlayerLocationUpgrades.Settlement;
+      const upgrade =
+        CampUpgrades[args.upgrade] || SettlementUpgrades[args.upgrade];
+
       if (!upgrade) {
         throw new UserInputError("Unknown upgrade!");
       }
-      const isSettlement = upgrade.type === PlayerLocationUpgrades.Settlement;
 
       if (isSettlement) {
         if (isCloseToSpecialLocation(camp.location)) {
@@ -429,10 +1264,23 @@ const resolvers: Resolvers = {
 
       let canAfford = true;
       let resourceName = "";
-      upgrade.cost.forEach((cost) => {
+
+      await upgrade.cost.reduce<Promise<void>>(async (memo, cost) => {
+        // let previous run fully first
+        await memo;
         if (!canAfford) {
           return;
         }
+
+        const resources = await context.db.playerLocation.getResourceData(
+          camp,
+          cost.name,
+        );
+
+        const total = resources.reduce((memo, val) => {
+          return memo + val.resource.value;
+        }, 0);
+
         if (cost.name === "gold") {
           canAfford = cost.value <= hero.gold;
           if (!canAfford) {
@@ -440,18 +1288,12 @@ const resolvers: Resolvers = {
           }
           return;
         }
-        const resource = camp.resources.find((res) => res.name === cost.name);
-        if (!resource) {
+        if (total < cost.value) {
           canAfford = false;
           resourceName = cost.name;
           return;
         }
-        canAfford = resource.value >= cost.value;
-
-        if (!canAfford) {
-          resourceName = cost.name;
-        }
-      });
+      }, new Promise((resolve) => resolve()));
 
       if (!canAfford) {
         throw new UserInputError(
@@ -459,17 +1301,25 @@ const resolvers: Resolvers = {
         );
       }
 
-      upgrade.cost.forEach((cost) => {
-        if (cost.name === "gold") {
-          hero.gold -= Math.round(cost.value);
-          return;
-        }
-        const resource = camp.resources.find((res) => res.name === cost.name);
-        if (!resource) {
-          return;
-        }
-        resource.value -= Math.round(cost.value);
-      });
+      await Promise.all(
+        upgrade.cost.map(async (cost) => {
+          if (cost.name === "gold") {
+            hero.gold -= Math.round(cost.value);
+            return;
+          }
+
+          const result = await context.db.playerLocation.spendResources(
+            camp,
+            cost.name,
+            cost.value,
+          );
+          if (!result) {
+            throw new UserInputError(
+              `You do not have enough ${cost.name} for that upgrade!`,
+            );
+          }
+        }),
+      );
 
       camp.upgrades.push(upgrade.type);
 
@@ -510,15 +1360,27 @@ const resolvers: Resolvers = {
         throw new UserInputError("You cannot purchase that resource");
       }
 
-      const goldCost = args.amount * resourceCost;
+      const goldCost = Math.round(args.amount * resourceCost);
 
       if (hero.gold < goldCost) {
-        throw new UserInputError(
-          "You do not have enough gold to get those resources!",
+        const home = await context.db.playerLocation.getHome(hero.id);
+        if (!home) {
+          throw new UserInputError("You don't have a working capital");
+        }
+        const result = await context.db.playerLocation.spendResources(
+          home,
+          "bonds",
+          Math.ceil(goldCost / 1000000),
         );
-      }
 
-      hero.gold -= Math.round(goldCost);
+        if (!result) {
+          throw new UserInputError(
+            "You do not have enough gold to get those resources!",
+          );
+        }
+      } else {
+        hero.gold -= goldCost;
+      }
 
       context.db.playerLocation.addResource(camp, args.resource, args.amount);
       await context.db.playerLocation.put(camp);
@@ -594,18 +1456,6 @@ const resolvers: Resolvers = {
         throw new UserInputError("You cannot move while dead!");
       }
 
-      // const currentLocations = specialLocations(
-      //   hero.location.x,
-      //   hero.location.y,
-      //   hero.location.map as MapNames
-      // );
-
-      // const targetLocations = specialLocations(
-      //   args.x,
-      //   args.y,
-      //   hero.location.map as MapNames
-      // );
-
       const currentLocation = hero.location;
       const targetLocation = {
         x: Math.min(127, Math.max(0, args.x)),
@@ -627,6 +1477,16 @@ const resolvers: Resolvers = {
         );
       }
 
+      if (checkTeleport(context, hero)) {
+        await context.db.hero.put(hero);
+
+        return {
+          hero,
+          account,
+          monsters: [],
+        };
+      }
+
       hero.location.x = targetLocation.x;
       hero.location.y = targetLocation.y;
 
@@ -638,6 +1498,7 @@ const resolvers: Resolvers = {
         monsters: [],
       };
     },
+
     async voidTravel(parent, args, context) {
       if (!context?.auth?.id) {
         throw new ForbiddenError("Missing auth");
@@ -892,10 +1753,18 @@ const resolvers: Resolvers = {
       }
       return parent.resources;
     },
+    async upkeep(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+      return context.db.playerLocation.calculateUpkeepCosts(parent);
+    },
+
     async publicOwner(parent, args, context): Promise<PublicHero> {
       const hero = await context.db.hero.get(parent.owner);
       return context.db.hero.publicHero(hero, true);
     },
+
     async connections(parent, args, context): Promise<PlayerLocation[]> {
       if (!context?.auth?.id) {
         throw new ForbiddenError("Missing auth");
@@ -920,40 +1789,92 @@ const resolvers: Resolvers = {
         return [];
       }
       const hero = await context.db.hero.get(context.auth.id);
-      const playerLocation = await context.db.playerLocation.get(parent.owner);
+      const playerLocation = parent;
 
       if (!playerLocation) {
         return [];
       }
 
-      const upgradeList: PlayerLocationUpgradeDescription[] = [];
+      const upgradeList: PlayerLocationUpgradeDescription[] =
+        getUpgradesForLocation(playerLocation);
 
-      upgradeList.push(...Object.values(CampUpgrades));
-
-      return upgradeList
-        .filter((upgrade) => {
-          if (playerLocation.upgrades.indexOf(upgrade.type) > -1) {
-            return false;
-          }
-          if (
-            !upgrade.cost.reduce((canAfford, cost) => {
-              const resource = playerLocation.resources.find(
-                (res) => res.name === cost.name,
-              );
-              if (!resource) {
-                return canAfford;
-              }
-              return canAfford && cost.value <= (resource.maximum ?? 0);
-            }, true)
-          ) {
-            return false;
-          }
-          return true;
-        })
-        .slice(0, 3);
+      return upgradeList.slice(0, 3);
     },
   },
   SettlementManager: {
+    async adjacentTiles(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+
+      const connections = await context.db.playerLocation.getConnections(
+        parent.capital,
+      );
+      const foundEdges = {
+        [parent.capital.location.x]: {
+          [parent.capital.location.y]: false,
+        },
+      };
+      const knownLocations = {
+        [parent.capital.location.x]: {
+          [parent.capital.location.y]: true,
+        },
+      };
+      function checkEdge(x: number, y: number) {
+        if (x < 0 || y < 0 || x >= 128 || y >= 96) {
+          return false;
+        }
+        if (knownLocations[x]?.[y]) {
+          return false;
+        }
+        if (!foundEdges[x]) {
+          foundEdges[x] = {};
+        }
+        foundEdges[x][y] = true;
+      }
+      function checkLocation(location: PlayerLocation) {
+        if (!knownLocations[location.location.x]) {
+          knownLocations[location.location.x] = {};
+        }
+        knownLocations[location.location.x][location.location.y] = true;
+        if (foundEdges[location.location.x]) {
+          foundEdges[location.location.x][location.location.y] = false;
+        }
+        checkEdge(location.location.x + 1, location.location.y);
+        checkEdge(location.location.x - 1, location.location.y);
+        checkEdge(location.location.x, location.location.y + 1);
+        checkEdge(location.location.x, location.location.y - 1);
+      }
+      connections.forEach(checkLocation);
+      checkLocation(parent.capital);
+
+      const edges: PlayerLocation[] = [];
+      await Promise.all(
+        Object.keys(foundEdges).map(async (xStr) => {
+          const x = Number(xStr);
+          await Promise.all(
+            Object.keys(foundEdges[x]).map(async (yStr) => {
+              const y = Number(yStr);
+              if (!foundEdges[x][y]) {
+                return;
+              }
+              try {
+                const playerLocation = await context.db.playerLocation.get(
+                  context.db.playerLocation.locationId({
+                    x,
+                    y,
+                    map: parent.capital.location.map,
+                  }),
+                );
+                edges.push(playerLocation);
+              } catch (e) {}
+            }),
+          );
+        }),
+      );
+
+      return edges;
+    },
     async availableUpgrades(parent, args, context) {
       if (!context?.auth?.id) {
         throw new ForbiddenError("Missing auth");
@@ -961,6 +1882,8 @@ const resolvers: Resolvers = {
       if (parent.id !== context.auth.id) {
         return [];
       }
+
+      // get fucked i guess
       return [];
     },
     async availableBuildings(parent, args, context) {
@@ -973,21 +1896,50 @@ const resolvers: Resolvers = {
 
       const result: PlayerLocationBuildingDescription[] = [];
 
-      if (canAffordBuilding(parent.capital, PlayerLocationType.Farm)) {
+      if (shouldSeeBuilding(parent.capital, PlayerLocationType.Farm)) {
         result.push(Buildings[PlayerLocationType.Farm]);
       }
       if (
         parent.capital.upgrades.indexOf(PlayerLocationUpgrades.HasBuiltFarm) < 0
       ) {
-        console.log("has never built a farm");
+        // console.log("has never built a farm");
         return result;
       }
 
-      if (canAffordBuilding(parent.capital, PlayerLocationType.Apiary)) {
-        result.push(Buildings[PlayerLocationType.Apiary]);
+      const buildingsAfterFarm: DescribedBuildings[] = [
+        PlayerLocationType.Apiary,
+        PlayerLocationType.Treasury,
+      ];
+      buildingsAfterFarm.forEach((type) => {
+        if (shouldSeeBuilding(parent.capital, type)) {
+          result.push(Buildings[type]);
+        }
+      });
+
+      const hero = await context.db.hero.get(context.auth.id);
+      if (countEnchantments(hero, EnchantmentType.UpgradedSettlement) === 0) {
+        return result;
       }
 
+      const buildingsAfterGovernorsTitle: DescribedBuildings[] = [
+        PlayerLocationType.Barracks,
+        PlayerLocationType.Garrison,
+      ];
+      buildingsAfterGovernorsTitle.forEach((type) => {
+        if (shouldSeeBuilding(parent.capital, type)) {
+          result.push(Buildings[type]);
+        }
+      });
+
       return result;
+    },
+  },
+  PlayerLocationResponse: {
+    async account(parent, args, context) {
+      if (!context?.auth?.id) {
+        throw new ForbiddenError("Missing auth");
+      }
+      return context.db.account.get(context.auth.id);
     },
   },
 };
