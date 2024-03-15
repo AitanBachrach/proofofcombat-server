@@ -95,16 +95,33 @@ export class logger {
 
     log(message?: any, ...optionalParams: any[]): void {
         let logmessage = util.format(message, optionalParams);
+        let length_items = miscLog.add(logmessage)
+        screen.render();
     }
     
     error(message?: any, ...optionalParams: any[]): void {
         let logmessage = util.format(message, optionalParams);
+        let length_items = errorLog.add(logmessage)
+        screen.render();
     }
 
     chat(message?: any, ...optionalParams: any[]): void {
         let logmessage = formatting(message, optionalParams);
+        let length_items = chatBox.add(logmessage)
+        //If we wanted to ever prune items we could do it here
+        screen.render();
     }
 
+    players(joined : boolean = true, playerName : string): void {
+      let item_index = playerList.getItemIndex(playerName)
+      if (item_index>-1 && !joined){
+        playerList.removeItem(item_index)
+      }
+      else if (joined && item_index == -1){
+        playerList.addItem(playerName)
+      }
+      screen.render();
+    }
 }
 
 
@@ -116,7 +133,14 @@ export function formatting(message?: any, ...optionalParams: any[]): string {
     return formattedString
 }
 
-/*
 let testlogger : logger = new logger()
 testlogger.start()
-*/
+
+testlogger.players(true, "andy")
+testlogger.players(true, "sally")
+testlogger.players(false, "sally")
+testlogger.players(true, "sally")
+testlogger.players(true, "andy")
+testlogger.players(false, "sally")
+testlogger.players(true, "sally")
+testlogger.players(false, "andy")
